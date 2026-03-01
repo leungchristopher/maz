@@ -1,0 +1,18 @@
+[project]
+name = "maz"
+version = "0.1.0"
+description = "Multiplayer AlphaZero for 3-player Connect Four"
+requires-python = ">=3.10"
+dependencies = [
+    "jax[cpu]>=0.4.20",
+    "flax>=0.8.0",
+    "optax>=0.1.7",
+    "chex>=0.1.85",
+]
+
+[project.optional-dependencies]
+colab = ["orbax-checkpoint>=0.6.0", "tqdm>=4.66", "wandb>=0.17"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
