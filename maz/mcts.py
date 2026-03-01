@@ -42,6 +42,31 @@ class MCTSTree:
     num_nodes: chex.Array      # scalar int32, number of allocated nodes
 
 
+def batched_new_tree(n: int) -> MCTSTree:
+    """Create N trees with leading batch dimension: (N, MAX_NODES, ...)."""
+    return MCTSTree(
+        visit_count=jnp.zeros((n, MAX_NODES), dtype=jnp.int32),
+        value_sum=jnp.zeros((n, MAX_NODES, NUM_PLAYERS), dtype=jnp.float32),
+        prior=jnp.zeros((n, MAX_NODES, NUM_ACTIONS), dtype=jnp.float32),
+        children=jnp.full((n, MAX_NODES, NUM_ACTIONS), -1, dtype=jnp.int32),
+        parent=jnp.full((n, MAX_NODES), -1, dtype=jnp.int32),
+        parent_action=jnp.full((n, MAX_NODES), -1, dtype=jnp.int32),
+        player=jnp.zeros((n, MAX_NODES), dtype=jnp.int32),
+        virtual_loss=jnp.zeros((n, MAX_NODES), dtype=jnp.float32),
+        valid_actions=jnp.zeros((n, MAX_NODES, NUM_ACTIONS), dtype=jnp.bool_),
+        num_nodes=jnp.zeros(n, dtype=jnp.int32),
+    )
+
+
+def expand_or_noop(tree, node_idx, state, prior, value, is_done):
+    """Expand if not done, noop if done. Clean under vmap (no lax.cond)."""
+    expanded = expand_node(tree, node_idx, state, prior, value)
+    return jax.tree.map(
+        lambda new, old: jnp.where(is_done, old, new),
+        expanded, tree,
+    )
+
+
 def new_tree() -> MCTSTree:
     return MCTSTree(
         visit_count=jnp.zeros(MAX_NODES, dtype=jnp.int32),
@@ -142,7 +167,7 @@ def select_leaf(tree: MCTSTree, states: chex.Array) -> tuple:
 
         return (tree, child, new_state, path, path_len)
 
-    max_depth = 50
+    max_depth = 20
     path = jnp.full(max_depth, -1, dtype=jnp.int32)
     path = path.at[0].set(0)  # root
     init_carry = (tree, jnp.int32(0), states, path, jnp.int32(1))
@@ -225,7 +250,7 @@ def backpropagate(tree: MCTSTree, node_idx: int, value: chex.Array,
         )
         return tree
 
-    max_depth = 50
+    max_depth = 20
     tree = jax.lax.fori_loop(0, max_depth, body_fn, tree)
     return tree
 
@@ -270,7 +295,7 @@ def search(state: GameState, net, variables, rng: chex.PRNGKey,
     tree = init_root(tree, state, root_prior, noise_rng)
     tree = expand_node(tree, 0, state, root_prior, root_value)
     tree = backpropagate(tree, 0, root_value,
-                         jnp.array([0] + [-1] * 49, dtype=jnp.int32),
+                         jnp.array([0] + [-1] * 19, dtype=jnp.int32),
                          jnp.int32(1))
 
     for sim in range(num_simulations):

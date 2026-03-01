@@ -1,7 +1,13 @@
 """Orchestration: self-play → train → repeat."""
 
+import os
 import jax
 import jax.numpy as jnp
+
+# Persistent compilation cache — avoids re-compiling JIT kernels across runs
+_default_cache = os.path.join(os.path.dirname(__file__), "..", ".jax_cache")
+jax.config.update("jax_compilation_cache_dir",
+                  os.environ.get("JAX_CACHE_DIR", os.path.abspath(_default_cache)))
 
 from maz.network import create_network, init_params
 from maz.selfplay import run_selfplay
@@ -14,8 +20,8 @@ WEIGHT_DECAY = 1e-4
 BATCH_SIZE = 64
 EPOCHS_PER_WINDOW = 2
 NUM_GAMES_PER_GEN = 128
-NUM_SIMULATIONS = 50
-NUM_GENERATIONS = 100
+NUM_SIMULATIONS = 25
+NUM_GENERATIONS = 50
 TEMPERATURE = 1.0
 SEED = 42
 CHECKPOINT_DIR = "/content/drive/MyDrive/maz_checkpoints"
@@ -25,6 +31,7 @@ CHECKPOINT_DIR = "/content/drive/MyDrive/maz_checkpoints"
 def main(checkpoint_dir=None, use_wandb=False, resume=True):
     if checkpoint_dir is None:
         checkpoint_dir = CHECKPOINT_DIR
+    checkpoint_dir = os.path.abspath(checkpoint_dir)
 
     try:
         from tqdm.auto import tqdm
@@ -86,7 +93,7 @@ def main(checkpoint_dir=None, use_wandb=False, resume=True):
         print(f"=== Generation {gen + 1}/{NUM_GENERATIONS} ===")
 
         # 1. Self-play
-        print("Self-play...")
+        print("Self-play...", flush=True)
         rng, sp_rng = jax.random.split(rng)
         games = run_selfplay(net, variables, sp_rng,
                              num_games=NUM_GAMES_PER_GEN,
