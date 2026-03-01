@@ -134,12 +134,17 @@ def batched_init_states(n: int) -> GameState:
     )
 
 
-def _make_move_fn(net, num_games, num_simulations):
-    """Factory returning a JIT-compiled function that performs one full move.
+def _make_move_fns(net, num_games, num_simulations):
+    """Factory returning JIT-compiled functions for one move.
 
-    The returned function fuses root eval, K-parallel sim loop (via
-    fori_loop + scan), policy extraction, and action sampling into a single
-    compiled XLA kernel.
+    Returns (root_fn, sim_batch_fn, finish_fn):
+      - root_fn: root eval + tree init → (obs, priors, values, trees)
+      - sim_batch_fn: K parallel select + batched NN + expand/backprop
+      - finish_fn: policy extraction + action sampling
+
+    Splitting avoids nesting fori_loop/scan inside a single JIT, which
+    causes multi-minute XLA compilation. The Python sim loop (7 iters)
+    adds negligible overhead vs. the old 50-iter loop.
     """
     N = num_games
     K = SIMS_PER_BATCH
@@ -163,8 +168,8 @@ def _make_move_fn(net, num_games, num_simulations):
     ones_N = jnp.ones(N, dtype=jnp.int32)
 
     @jax.jit
-    def move_fn(states, variables, noise_rngs, action_rngs, temp):
-        # --- Root eval + tree init ---
+    def root_fn(states, variables, noise_rngs):
+        """Root eval + tree init."""
         obs = v_encode(states)
         logits, values = net.apply(variables, obs, train=False)
         priors = jax.nn.softmax(logits)
@@ -172,48 +177,49 @@ def _make_move_fn(net, num_games, num_simulations):
         trees = v_init_root(trees, states, priors, noise_rngs)
         trees = v_expand(trees, node_zeros, states, priors, values)
         trees = v_backprop(trees, node_zeros, values, root_paths, ones_N)
+        return obs, trees
 
-        # --- Fused sim loop: fori_loop over ceil(sims/K) batches ---
-        def sim_batch_body(_, trees):
-            # 1) Select K leaves sequentially (virtual loss steers diversity)
-            def select_one(trees, _):
-                trees, idxs, lstates, paths, plens = v_select(trees, states)
-                return trees, (idxs, lstates, paths, plens)
-            trees_vl, (all_idxs, all_lstates, all_paths, all_plens) = \
-                jax.lax.scan(select_one, trees, None, length=K)
-            # Shapes: all_idxs (K,N), all_lstates (K,N,...), etc.
+    @jax.jit
+    def sim_batch_fn(trees, states, variables):
+        """One batch of K parallel sims: select K leaves, batch NN, expand+backprop."""
+        # 1) Select K leaves sequentially (virtual loss steers diversity)
+        def select_one(trees, _):
+            trees, idxs, lstates, paths, plens = v_select(trees, states)
+            return trees, (idxs, lstates, paths, plens)
+        trees_vl, (all_idxs, all_lstates, all_paths, all_plens) = \
+            jax.lax.scan(select_one, trees, None, length=K)
 
-            # 2) Batch NN eval: (K,N,...) → (K*N,...) → NN → reshape
-            flat_lstates = jax.tree.map(
-                lambda x: x.reshape(K * N, *x.shape[2:]), all_lstates)
-            flat_obs = v_encode(flat_lstates)
-            flat_logits, flat_vals = net.apply(
-                variables, flat_obs, train=False)
-            flat_scores = v_get_scores(flat_lstates)
+        # 2) Batch NN eval: (K,N,...) → (K*N,...) → NN → reshape
+        flat_lstates = jax.tree.map(
+            lambda x: x.reshape(K * N, *x.shape[2:]), all_lstates)
+        flat_obs = v_encode(flat_lstates)
+        flat_logits, flat_vals = net.apply(
+            variables, flat_obs, train=False)
+        flat_scores = v_get_scores(flat_lstates)
 
-            all_priors = jax.nn.softmax(flat_logits).reshape(K, N, NUM_ACTIONS)
-            all_vals = flat_vals.reshape(K, N, NUM_PLAYERS)
-            all_scores = flat_scores.reshape(K, N, NUM_PLAYERS)
-            all_done = all_lstates.done  # (K, N)
-            all_vals = jnp.where(all_done[:, :, None], all_scores, all_vals)
+        all_priors = jax.nn.softmax(flat_logits).reshape(K, N, NUM_ACTIONS)
+        all_vals = flat_vals.reshape(K, N, NUM_PLAYERS)
+        all_scores = flat_scores.reshape(K, N, NUM_PLAYERS)
+        all_done = all_lstates.done  # (K, N)
+        all_vals = jnp.where(all_done[:, :, None], all_scores, all_vals)
 
-            # 3) Expand + backprop K leaves sequentially
-            def expand_backprop_one(trees, k_data):
-                idxs, lstates_k, priors_k, vals_k, done_k, paths_k, plens_k = k_data
-                trees = v_expand_or_noop(
-                    trees, idxs, lstates_k, priors_k, vals_k, done_k)
-                trees = v_backprop(trees, idxs, vals_k, paths_k, plens_k)
-                return trees, None
+        # 3) Expand + backprop K leaves sequentially
+        def expand_backprop_one(trees, k_data):
+            idxs, lstates_k, priors_k, vals_k, done_k, paths_k, plens_k = k_data
+            trees = v_expand_or_noop(
+                trees, idxs, lstates_k, priors_k, vals_k, done_k)
+            trees = v_backprop(trees, idxs, vals_k, paths_k, plens_k)
+            return trees, None
 
-            k_data = (all_idxs, all_lstates, all_priors, all_vals,
-                      all_done, all_paths, all_plens)
-            trees, _ = jax.lax.scan(
-                expand_backprop_one, trees_vl, k_data)
-            return trees
+        k_data = (all_idxs, all_lstates, all_priors, all_vals,
+                  all_done, all_paths, all_plens)
+        trees, _ = jax.lax.scan(
+            expand_backprop_one, trees_vl, k_data)
+        return trees
 
-        trees = jax.lax.fori_loop(0, num_batches, sim_batch_body, trees)
-
-        # --- Policy + action ---
+    @jax.jit
+    def finish_fn(trees, states, action_rngs, temp):
+        """Policy extraction + action sampling."""
         policies = v_get_policy(trees, temp)
         safe_policies = jnp.where(
             states.done[:, None],
@@ -222,9 +228,9 @@ def _make_move_fn(net, num_games, num_simulations):
             lambda r, p: jax.random.choice(r, NUM_ACTIONS, p=p)
         )(action_rngs, safe_policies)
         new_states = v_step(states, actions)
-        return obs, safe_policies, actions, new_states
+        return safe_policies, actions, new_states
 
-    return move_fn
+    return root_fn, sim_batch_fn, finish_fn, num_batches
 
 
 def run_selfplay(net, variables, rng: chex.PRNGKey,
@@ -245,7 +251,8 @@ def run_selfplay(net, variables, rng: chex.PRNGKey,
         tqdm = None
 
     N = num_games
-    move_fn = _make_move_fn(net, N, num_simulations)
+    root_fn, sim_batch_fn, finish_fn, num_batches = _make_move_fns(
+        net, N, num_simulations)
     states = batched_init_states(N)
 
     # Pre-allocate recording arrays: (N, max_moves, ...)
@@ -268,9 +275,11 @@ def run_selfplay(net, variables, rng: chex.PRNGKey,
         active_mask = ~states.done
         temp = jnp.float32(temperature if move_num < temp_threshold else 0.01)
 
-        obs, policies, actions, new_states = move_fn(
-            states, variables,
-            move_rngs[move_num, :, 0], move_rngs[move_num, :, 1], temp)
+        obs, trees = root_fn(states, variables, move_rngs[move_num, :, 0])
+        for _ in range(num_batches):
+            trees = sim_batch_fn(trees, states, variables)
+        policies, actions, new_states = finish_fn(
+            trees, states, move_rngs[move_num, :, 1], temp)
 
         # Record (cheap array updates)
         all_obs = all_obs.at[:, move_num].set(
