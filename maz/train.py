@@ -3,6 +3,7 @@
 import functools
 from collections import deque
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 import optax
@@ -57,29 +58,36 @@ def average_positions(states: jnp.ndarray, policies: jnp.ndarray,
                       scores: jnp.ndarray):
     """Deduplicate positions by board hash, averaging π and z.
 
-    This runs outside JIT as it uses Python dict for hashing.
+    Uses numpy vectorized hashing + pandas-free groupby via np.unique.
     """
-    seen = {}
-    for i in range(len(states)):
-        key = states[i].tobytes()
-        if key in seen:
-            idx_list = seen[key]
-            idx_list.append(i)
-        else:
-            seen[key] = [i]
+    # Move to numpy for fast hashing
+    s_np = np.asarray(states).reshape(len(states), -1)
+    p_np = np.asarray(policies)
+    z_np = np.asarray(scores)
 
-    unique_states = []
-    unique_policies = []
-    unique_scores = []
-    for key, indices in seen.items():
-        unique_states.append(states[indices[0]])
-        unique_policies.append(jnp.mean(policies[jnp.array(indices)], axis=0))
-        unique_scores.append(jnp.mean(scores[jnp.array(indices)], axis=0))
+    # Hash each row to a single int64 for fast grouping
+    # Use a view-based approach: treat each flattened state as bytes
+    s_bytes = np.ascontiguousarray(s_np).view(
+        np.dtype((np.void, s_np.dtype.itemsize * s_np.shape[1])))
+    _, unique_idx, inverse = np.unique(
+        s_bytes, return_index=True, return_inverse=True)
+    inverse = inverse.ravel()
+
+    n_unique = len(unique_idx)
+
+    # Scatter-add policies and scores, then divide by counts
+    counts = np.bincount(inverse, minlength=n_unique).astype(np.float32)
+    avg_policies = np.zeros((n_unique, p_np.shape[1]), dtype=np.float32)
+    avg_scores = np.zeros((n_unique, z_np.shape[1]), dtype=np.float32)
+    np.add.at(avg_policies, inverse, p_np)
+    np.add.at(avg_scores, inverse, z_np)
+    avg_policies /= counts[:, None]
+    avg_scores /= counts[:, None]
 
     return (
-        jnp.stack(unique_states),
-        jnp.stack(unique_policies),
-        jnp.stack(unique_scores),
+        jnp.asarray(states[unique_idx]),
+        jnp.asarray(avg_policies),
+        jnp.asarray(avg_scores),
     )
 
 
