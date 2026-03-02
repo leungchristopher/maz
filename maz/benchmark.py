@@ -103,8 +103,8 @@ def heuristic_eval(board_np):
 # ---------------------------------------------------------------------------
 
 def _np_get_valid(board_np):
-    """Return list of valid columns."""
-    return [c for c in range(COLS) if board_np[0, c] == 0]
+    """Return list of valid columns in center-first order."""
+    return [c for c in CENTER_ORDER if board_np[0, c] == 0]
 
 
 def _np_drop(board_np, col, player_val):
@@ -216,7 +216,7 @@ class MaxNAgent(Agent):
         best_val = -float("inf")
 
         valid = _np_get_valid(board_np)
-        for c in sorted(valid, key=lambda x: CENTER_ORDER.index(x) if x in CENTER_ORDER else 99):
+        for c in valid:
             child = _np_drop(board_np, c, current + 1)
             if _np_check_win(child, current + 1):
                 return c
@@ -251,7 +251,7 @@ class MaxNAgent(Agent):
 
         valid = _np_get_valid(board_np)
         best_vals = None
-        for c in sorted(valid, key=lambda x: CENTER_ORDER.index(x) if x in CENTER_ORDER else 99):
+        for c in valid:
             child = _np_drop(board_np, c, player + 1)
             if _np_check_win(child, player + 1):
                 vals = [-1.0, -1.0, -1.0]
@@ -283,7 +283,7 @@ class ParanoidAgent(Agent):
         best_val = -float("inf")
 
         valid = _np_get_valid(board_np)
-        for c in sorted(valid, key=lambda x: CENTER_ORDER.index(x) if x in CENTER_ORDER else 99):
+        for c in valid:
             child = _np_drop(board_np, c, current + 1)
             if _np_check_win(child, current + 1):
                 return c
@@ -320,7 +320,7 @@ class ParanoidAgent(Agent):
 
         if is_max:
             val = -float("inf")
-            for c in sorted(valid, key=lambda x: CENTER_ORDER.index(x) if x in CENTER_ORDER else 99):
+            for c in valid:
                 child = _np_drop(board_np, c, player + 1)
                 if _np_check_win(child, player + 1):
                     self._tt[key] = 1.0
@@ -333,7 +333,7 @@ class ParanoidAgent(Agent):
                     break
         else:
             val = float("inf")
-            for c in sorted(valid, key=lambda x: CENTER_ORDER.index(x) if x in CENTER_ORDER else 99):
+            for c in valid:
                 child = _np_drop(board_np, c, player + 1)
                 if _np_check_win(child, player + 1):
                     v = -1.0
@@ -374,7 +374,7 @@ class ShapleyAgent(Agent):
         best_action = CENTER_ORDER[0]
         best_shapley = -float("inf")
 
-        for c in sorted(valid, key=lambda x: CENTER_ORDER.index(x) if x in CENTER_ORDER else 99):
+        for c in valid:
             child = _np_drop(board_np, c, current + 1)
             shapley_vals = self._compute_shapley(child, (current + 1) % NUM_PLAYERS)
             if shapley_vals[current] > best_shapley:
@@ -439,7 +439,7 @@ class ShapleyAgent(Agent):
         if is_max:
             val = -float("inf")
             alpha, beta = -float("inf"), float("inf")
-            for c in sorted(valid, key=lambda x: CENTER_ORDER.index(x) if x in CENTER_ORDER else 99):
+            for c in valid:
                 child = _np_drop(board_np, c, player + 1)
                 if _np_check_win(child, player + 1):
                     v = 1.0
@@ -453,7 +453,7 @@ class ShapleyAgent(Agent):
         else:
             val = float("inf")
             alpha, beta = -float("inf"), float("inf")
-            for c in sorted(valid, key=lambda x: CENTER_ORDER.index(x) if x in CENTER_ORDER else 99):
+            for c in valid:
                 child = _np_drop(board_np, c, player + 1)
                 if _np_check_win(child, player + 1):
                     v = -1.0
@@ -523,6 +523,8 @@ def _play_games_batched(seat_agents, n_games, rng_key, net, variables, sims):
     done_np = np.zeros(N, dtype=bool)
     winners_np = np.full(N, -1, dtype=np.int32)
     move_counts_np = np.zeros(N, dtype=np.int32)
+    # Record action history per game
+    action_histories = [[] for _ in range(N)]
 
     for move_num in range(max_moves):
         if done_np.all():
@@ -556,6 +558,12 @@ def _play_games_batched(seat_agents, n_games, rng_key, net, variables, sims):
             actions = jnp.array(action_list, dtype=jnp.int32)
             new_states = v_step(states, actions)
 
+        # Record actions for active games
+        actions_np = np.array(actions)
+        for i in range(N):
+            if active[i]:
+                action_histories[i].append(int(actions_np[i]))
+
         # Mask: keep old state for already-done games
         active_jnp = jnp.array(active)
         states = jax.tree.map(
@@ -578,13 +586,17 @@ def _play_games_batched(seat_agents, n_games, rng_key, net, variables, sims):
             done_np[i] = True
             move_counts_np[i] = max_moves
 
-    return winners_np, move_counts_np
+    return winners_np, move_counts_np, action_histories
 
 
 def play_one_game(agents, rng_key=None):
-    """Play one game with 3 classical agents. Returns (winner, scores, num_moves)."""
+    """Play one game with 3 classical agents.
+
+    Returns (winner, scores, num_moves, actions).
+    """
     state = init_state()
     move = 0
+    actions = []
     while not state.done:
         cp = int(state.current_player)
         agent = agents[cp]
@@ -593,9 +605,10 @@ def play_one_game(agents, rng_key=None):
         else:
             sub = None
         action = agent.select_action(state, rng_key=sub)
+        actions.append(int(action))
         state = step(state, jnp.int32(action))
         move += 1
-    return int(state.winner), np.array(get_scores(state)), move
+    return int(state.winner), np.array(get_scores(state)), move, actions
 
 
 # ---------------------------------------------------------------------------
@@ -611,7 +624,18 @@ def run_matchup(agent_factories, n_games, rng_key,
     If any agent is AlphaZeroAgent, uses batched GPU play.
     """
     agents_base = [f() for f in agent_factories]
-    agent_names = [a.name for a in agents_base]
+    raw_names = [a.name for a in agents_base]
+    # Disambiguate duplicate names by appending seat index
+    seen = {}
+    agent_names = []
+    for i, name in enumerate(raw_names):
+        count = raw_names.count(name)
+        if count > 1:
+            idx = seen.get(name, 0)
+            seen[name] = idx + 1
+            agent_names.append(f"{name}[{i}]")
+        else:
+            agent_names.append(name)
     has_az = any(isinstance(a, AlphaZeroAgent) for a in agents_base)
 
     wins = {name: 0 for name in agent_names}
@@ -619,6 +643,7 @@ def run_matchup(agent_factories, n_games, rng_key,
     seat_wins = [0, 0, 0]
     total_games = 0
     total_moves = 0
+    games = []  # list of per-game records
 
     for rotation in range(3):
         rotated_factories = (agent_factories[-rotation:] + agent_factories[:-rotation]
@@ -630,7 +655,7 @@ def run_matchup(agent_factories, n_games, rng_key,
             # --- Batched GPU play ---
             seat_agents = [f() for f in rotated_factories]
             rng_key, batch_rng = jax.random.split(rng_key)
-            winners, move_counts = _play_games_batched(
+            winners, move_counts, action_histories = _play_games_batched(
                 seat_agents, n_games, batch_rng, net, variables, sims)
             for g in range(n_games):
                 total_games += 1
@@ -641,12 +666,18 @@ def run_matchup(agent_factories, n_games, rng_key,
                 else:
                     wins[rotated_names[w]] = wins.get(rotated_names[w], 0) + 1
                     seat_wins[w] += 1
+                games.append({
+                    "agents": list(rotated_names),
+                    "actions": action_histories[g],
+                    "winner": w,
+                    "num_moves": int(move_counts[g]),
+                })
         else:
             # --- Sequential play for classical-only matchups ---
             for g in range(n_games):
                 rng_key, game_key = jax.random.split(rng_key)
                 agents = [f() for f in rotated_factories]
-                winner, _scores, moves = play_one_game(agents, rng_key=game_key)
+                winner, _scores, moves, actions = play_one_game(agents, rng_key=game_key)
                 total_games += 1
                 total_moves += moves
                 if winner == -1:
@@ -654,6 +685,12 @@ def run_matchup(agent_factories, n_games, rng_key,
                 else:
                     wins[rotated_names[winner]] = wins.get(rotated_names[winner], 0) + 1
                     seat_wins[winner] += 1
+                games.append({
+                    "agents": list(rotated_names),
+                    "actions": actions,
+                    "winner": winner,
+                    "num_moves": moves,
+                })
 
     return {
         "agent_names": agent_names,
@@ -662,6 +699,7 @@ def run_matchup(agent_factories, n_games, rng_key,
         "total_games": total_games,
         "avg_moves": total_moves / total_games if total_games > 0 else 0,
         "seat_wins": seat_wins,
+        "games": games,
     }
 
 
@@ -670,7 +708,7 @@ def run_matchup(agent_factories, n_games, rng_key,
 # ---------------------------------------------------------------------------
 
 def run_benchmark(checkpoint_path, sims=200, n_games=50,
-                  maxn_depth=4, paranoid_depth=6, shapley_depth=3,
+                  maxn_depth=3, paranoid_depth=6, shapley_depth=3,
                   output_dir="benchmark_results"):
     """Run full benchmark suite."""
     output_path = Path(output_dir)
@@ -714,24 +752,21 @@ def run_benchmark(checkpoint_path, sims=200, n_games=50,
     all_results = {}
     rng = jax.random.PRNGKey(42)
 
-    # --- AZ vs 2×Agent matchups ---
-    print("\n=== AZ vs 2×Agent Matchups ===")
+    # --- 2×AZ vs Agent matchups ---
+    print("\n=== 2×AZ vs Agent Matchups ===")
     az_vs_results = {}
     for name, factory in classical_agents:
-        label = f"AZ vs 2×{name}"
+        label = f"2×AZ vs {name}"
         print(f"\n  {label} ({3 * n_games} games)...", flush=True)
         t0 = time.time()
         rng, sub = jax.random.split(rng)
-        result = run_matchup([make_az, factory, factory], n_games, sub,
+        result = run_matchup([make_az, make_az, factory], n_games, sub,
                              net=net, variables=variables, sims=sims)
         elapsed = time.time() - t0
-        az_name = result["agent_names"][0]
-        opp_name = result["agent_names"][1]
+        names = result["agent_names"]
         total = result["total_games"]
-        print(f"    {az_name}: {result['wins'].get(az_name, 0)}/{total} "
-              f"({100 * result['wins'].get(az_name, 0) / total:.0f}%), "
-              f"{opp_name}: {result['wins'].get(opp_name, 0)}/{total}, "
-              f"draws: {result['draws']}/{total}  [{elapsed:.1f}s]")
+        wins_str = ", ".join(f"{n}: {result['wins'].get(n, 0)}" for n in names)
+        print(f"    {wins_str}, draws: {result['draws']}/{total}  [{elapsed:.1f}s]")
         az_vs_results[name] = result
     all_results["az_vs"] = az_vs_results
 
@@ -782,20 +817,26 @@ def run_benchmark(checkpoint_path, sims=200, n_games=50,
     _plot_pairwise_heatmap(all_results, output_path)
     _plot_seat_advantage(homo_results, output_path)
 
-    # --- Save JSON summary ---
+    # --- Save JSON summary + game logs ---
     summary = _build_summary(all_results)
     json_path = output_path / "benchmark_summary.json"
     with open(json_path, "w") as f:
         json.dump(summary, f, indent=2)
+
+    games_log = _build_games_log(all_results)
+    games_path = output_path / "benchmark_games.json"
+    with open(games_path, "w") as f:
+        json.dump(games_log, f, separators=(",", ":"))
     print(f"\nResults saved to {output_path}/")
     print(f"  benchmark_az_vs.png")
     print(f"  benchmark_heatmap.png")
     print(f"  benchmark_seat_advantage.png")
     print(f"  benchmark_summary.json")
+    print(f"  benchmark_games.json ({len(games_log)} games)")
 
 
 def _build_summary(all_results):
-    """Convert results to JSON-serializable dict."""
+    """Convert results to JSON-serializable dict (stats only, no games)."""
     summary = {}
     for section, data in all_results.items():
         summary[section] = {}
@@ -810,36 +851,54 @@ def _build_summary(all_results):
     return summary
 
 
+def _build_games_log(all_results):
+    """Collect all game records into a flat list for saving."""
+    games = []
+    for section, data in all_results.items():
+        for matchup_name, result in data.items():
+            for game in result.get("games", []):
+                games.append({
+                    "matchup": matchup_name,
+                    "section": section,
+                    **game,
+                })
+    return games
+
+
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
 
 def _plot_az_vs_bar(az_vs_results, output_path):
-    """Plot 1: Grouped bar chart — AZ win rate vs opponent win rate vs draw rate."""
+    """Plot 1: Grouped bar chart — per-position win rates for 2×AZ vs Agent."""
     opponents = list(az_vs_results.keys())
-    az_rates = []
+    az0_rates = []
+    az1_rates = []
     opp_rates = []
     draw_rates = []
 
     for name, result in az_vs_results.items():
         total = result["total_games"]
-        az_name = result["agent_names"][0]  # AZ is always first
-        az_wins = result["wins"].get(az_name, 0)
-        opp_wins = sum(w for n, w in result["wins"].items() if n != az_name)
-        az_rates.append(az_wins / total)
-        opp_rates.append(opp_wins / total)
+        names = result["agent_names"]
+        wins = result["wins"]
+        # names are like ["AZ(s=200)[0]", "AZ(s=200)[1]", "Greedy"]
+        az0_rates.append(wins.get(names[0], 0) / total)
+        az1_rates.append(wins.get(names[1], 0) / total)
+        az2_val = wins.get(names[2], 0)
+        opp_rates.append(az2_val / total)
         draw_rates.append(result["draws"] / total)
 
     x = np.arange(len(opponents))
-    width = 0.25
+    width = 0.2
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.bar(x - width, az_rates, width, label="AlphaZero", color="#2196F3")
-    ax.bar(x, opp_rates, width, label="Opponent", color="#FF9800")
-    ax.bar(x + width, draw_rates, width, label="Draw", color="#9E9E9E")
+    ax.bar(x - 1.5 * width, az0_rates, width, label="AZ seat 0", color="#1565C0")
+    ax.bar(x - 0.5 * width, az1_rates, width, label="AZ seat 1", color="#42A5F5")
+    ax.bar(x + 0.5 * width, opp_rates, width, label="Opponent", color="#FF9800")
+    ax.bar(x + 1.5 * width, draw_rates, width, label="Draw", color="#9E9E9E")
 
-    ax.set_ylabel("Rate")
-    ax.set_title("AlphaZero vs 2×Classical Agent")
+    ax.set_ylabel("Win Rate")
+    ax.set_title("2×AlphaZero vs Classical Agent (per-position)")
     ax.set_xticks(x)
     ax.set_xticklabels(opponents, rotation=15, ha="right")
     ax.legend()
@@ -956,8 +1015,8 @@ def main():
                         help="MCTS simulations for AlphaZero (default: 200)")
     parser.add_argument("--games", type=int, default=50,
                         help="Games per rotation (total = 3×games per matchup, default: 50)")
-    parser.add_argument("--maxn-depth", type=int, default=4,
-                        help="MaxN search depth (default: 4)")
+    parser.add_argument("--maxn-depth", type=int, default=3,
+                        help="MaxN search depth (default: 3)")
     parser.add_argument("--paranoid-depth", type=int, default=6,
                         help="Paranoid search depth (default: 6)")
     parser.add_argument("--shapley-depth", type=int, default=3,
