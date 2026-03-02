@@ -4,8 +4,7 @@
 class Logger:
     """Logs training metrics to W&B if available, otherwise no-ops."""
 
-    def __init__(self, use_wandb=False, project="maz", run_id="maz-run",
-                 config=None):
+    def __init__(self, use_wandb=False, project="maz", config=None):
         self.use_wandb = use_wandb
         self._wandb = None
         if use_wandb:
@@ -14,8 +13,6 @@ class Logger:
                 self._wandb = wandb
                 wandb.init(
                     project=project,
-                    id=run_id,
-                    resume="allow",
                     config=config or {},
                 )
             except ImportError:
