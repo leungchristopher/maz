@@ -3,6 +3,9 @@
 Evaluates a trained AlphaZero agent against classical game-tree search baselines
 and plots win rates across homogeneous/heterogeneous player combinations.
 
+GPU-accelerated: AZ moves use the batched selfplay MCTS infrastructure
+(K×N NN batch size per sim batch) instead of sequential batch-size-1 calls.
+
 Usage:
     python -m maz.benchmark checkpoint.pkl [--sims 200] [--games 50] \
       [--maxn-depth 4] [--paranoid-depth 6] [--shapley-depth 3] \
@@ -12,6 +15,7 @@ Usage:
 import argparse
 import itertools
 import json
+import math
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -28,9 +32,10 @@ from maz.game import (
     GameState, init_state, step, get_valid_actions, get_scores, check_win,
     encode_state,
 )
-from maz.mcts import search
+from maz.mcts import batched_new_tree
 from maz.network import create_network
 from maz.play import load_from_pkl
+from maz.selfplay import _make_move_fns, batched_init_states
 
 # Center-first move ordering for better pruning
 CENTER_ORDER = [2, 1, 3, 0, 4]
@@ -398,10 +403,9 @@ class ShapleyAgent(Agent):
                             sub_val = self._coalition_eval(board_np, next_player,
                                                            sub, self.depth)
                             marginal = val - sub_val
-                        # Weight by |S|!(n-|S|-1)!/n! but simplified for n=3
+                        # Weight: |S-1|!(n-|S|)!/n!
                         n = NUM_PLAYERS
                         s = len(coal_set)
-                        import math
                         weight = math.factorial(s - 1) * math.factorial(n - s) / math.factorial(n)
                         shapley[p] += weight * marginal
         return shapley
@@ -466,33 +470,119 @@ class ShapleyAgent(Agent):
 
 
 # ---------------------------------------------------------------------------
-# 6. AlphaZeroAgent
+# 6. AlphaZeroAgent (marker for batched play; not used for select_action)
 # ---------------------------------------------------------------------------
 
 class AlphaZeroAgent(Agent):
-    def __init__(self, net, variables, sims=200):
-        self.net = net
-        self.variables = variables
+    """Marker agent for AlphaZero. Actual move selection uses batched MCTS."""
+    def __init__(self, sims=200):
         self.sims = sims
         self.name = f"AZ(s={sims})"
 
     def select_action(self, state, rng_key=None):
-        if rng_key is None:
-            rng_key = jax.random.PRNGKey(0)
-        policy = search(state, self.net, self.variables, rng_key,
-                        num_simulations=self.sims, temperature=0.01)
-        return int(jnp.argmax(policy))
+        raise RuntimeError("AlphaZeroAgent.select_action should not be called; "
+                           "use batched play_games instead")
 
 
 # ---------------------------------------------------------------------------
-# Game runner
+# Batched game runner — GPU-accelerated AZ via selfplay MCTS
 # ---------------------------------------------------------------------------
+
+def _play_games_batched(seat_agents, n_games, rng_key, net, variables, sims):
+    """Run n_games in parallel with batched GPU MCTS for AZ seats.
+
+    At move M, current_player = M % 3 (deterministic rotation), so all
+    active games share the same seat. AZ turns batch all N game states
+    through the selfplay MCTS infrastructure (K×N NN batch per sim batch).
+    Classical turns loop through individual games on CPU.
+
+    Args:
+        seat_agents: list of 3 Agent instances (one per seat).
+        n_games: number of games to run in parallel.
+        rng_key: JAX PRNG key.
+        net: AlphaZero network.
+        variables: network parameters.
+        sims: MCTS simulations for AZ.
+
+    Returns:
+        (winners, move_counts) — numpy arrays of shape (n_games,).
+        winners[i] = -1 for draw, 0/1/2 for winning seat.
+    """
+    N = n_games
+    max_moves = ROWS * COLS  # absolute max
+
+    # Identify which seats are AZ
+    az_seats = {i for i, a in enumerate(seat_agents) if isinstance(a, AlphaZeroAgent)}
+
+    # Get batched MCTS functions (JIT-compiled, cached by (net, N, sims))
+    root_fn, sim_batch_fn, finish_fn, num_batches = _make_move_fns(net, N, sims)
+    v_step = jax.vmap(step)
+
+    # Initialize batched game states
+    states = batched_init_states(N)
+    done_np = np.zeros(N, dtype=bool)
+    winners_np = np.full(N, -1, dtype=np.int32)
+    move_counts_np = np.zeros(N, dtype=np.int32)
+
+    for move_num in range(max_moves):
+        if done_np.all():
+            break
+
+        active = ~done_np
+        current_seat = move_num % NUM_PLAYERS
+
+        if current_seat in az_seats:
+            # --- Batched GPU MCTS for all N games ---
+            rng_key, noise_rng, action_rng = jax.random.split(rng_key, 3)
+            noise_rngs = jax.random.split(noise_rng, N)
+            action_rngs = jax.random.split(action_rng, N)
+
+            _, trees = root_fn(states, variables, noise_rngs)
+            for _ in range(num_batches):
+                trees = sim_batch_fn(trees, states, variables)
+            _policies, actions, new_states = finish_fn(
+                trees, states, action_rngs, jnp.float32(0.01))
+        else:
+            # --- Classical agent: loop through active games on CPU ---
+            agent = seat_agents[current_seat]
+            action_list = []
+            for i in range(N):
+                if active[i]:
+                    single_state = jax.tree.map(lambda x, _i=i: x[_i], states)
+                    rng_key, sub = jax.random.split(rng_key)
+                    action_list.append(agent.select_action(single_state, rng_key=sub))
+                else:
+                    action_list.append(0)  # dummy for done games
+            actions = jnp.array(action_list, dtype=jnp.int32)
+            new_states = v_step(states, actions)
+
+        # Mask: keep old state for already-done games
+        active_jnp = jnp.array(active)
+        states = jax.tree.map(
+            lambda new, old: jnp.where(
+                active_jnp.reshape(-1, *([1] * (new.ndim - 1))), new, old),
+            new_states, states)
+
+        # Record newly finished games
+        done_arr = np.array(states.done)
+        winner_arr = np.array(states.winner)
+        for i in range(N):
+            if active[i] and done_arr[i] and not done_np[i]:
+                done_np[i] = True
+                winners_np[i] = winner_arr[i]
+                move_counts_np[i] = move_num + 1
+
+    # Games that hit max_moves without ending are draws
+    for i in range(N):
+        if not done_np[i]:
+            done_np[i] = True
+            move_counts_np[i] = max_moves
+
+    return winners_np, move_counts_np
+
 
 def play_one_game(agents, rng_key=None):
-    """Play one game with 3 agents. Returns (winner, scores, num_moves).
-
-    winner: 0/1/2 or -1 for draw (refers to seat index, not agent).
-    """
+    """Play one game with 3 classical agents. Returns (winner, scores, num_moves)."""
     state = init_state()
     move = 0
     while not state.done:
@@ -508,18 +598,22 @@ def play_one_game(agents, rng_key=None):
     return int(state.winner), np.array(get_scores(state)), move
 
 
-def run_matchup(agent_factories, n_games, rng_key):
+# ---------------------------------------------------------------------------
+# Matchup runner
+# ---------------------------------------------------------------------------
+
+def run_matchup(agent_factories, n_games, rng_key,
+                net=None, variables=None, sims=200):
     """Run a matchup with seat rotation.
 
-    agent_factories: list of 3 callables that return Agent instances.
+    agent_factories: list of 3 callables returning Agent instances.
     Each rotation plays n_games. Total = 3 * n_games.
-
-    Returns dict with per-agent-type win counts, draws, per-seat stats.
+    If any agent is AlphaZeroAgent, uses batched GPU play.
     """
     agents_base = [f() for f in agent_factories]
     agent_names = [a.name for a in agents_base]
+    has_az = any(isinstance(a, AlphaZeroAgent) for a in agents_base)
 
-    # Stats: wins[agent_name] = count, seat_wins[seat] = count
     wins = {name: 0 for name in agent_names}
     draws = 0
     seat_wins = [0, 0, 0]
@@ -527,23 +621,39 @@ def run_matchup(agent_factories, n_games, rng_key):
     total_moves = 0
 
     for rotation in range(3):
-        # Rotate agents: rotation 0 = [A,B,C], 1 = [C,A,B], 2 = [B,C,A]
-        rotated_factories = agent_factories[-rotation:] + agent_factories[:-rotation] if rotation > 0 else list(agent_factories)
-        rotated_names = agent_names[-rotation:] + agent_names[:-rotation] if rotation > 0 else list(agent_names)
+        rotated_factories = (agent_factories[-rotation:] + agent_factories[:-rotation]
+                             if rotation > 0 else list(agent_factories))
+        rotated_names = (agent_names[-rotation:] + agent_names[:-rotation]
+                         if rotation > 0 else list(agent_names))
 
-        for g in range(n_games):
-            rng_key, game_key = jax.random.split(rng_key)
-            agents = [f() for f in rotated_factories]
-            winner, scores, moves = play_one_game(agents, rng_key=game_key)
-            total_games += 1
-            total_moves += moves
-
-            if winner == -1:
-                draws += 1
-            else:
-                winner_name = rotated_names[winner]
-                wins[winner_name] += 1
-                seat_wins[winner] += 1
+        if has_az and net is not None:
+            # --- Batched GPU play ---
+            seat_agents = [f() for f in rotated_factories]
+            rng_key, batch_rng = jax.random.split(rng_key)
+            winners, move_counts = _play_games_batched(
+                seat_agents, n_games, batch_rng, net, variables, sims)
+            for g in range(n_games):
+                total_games += 1
+                total_moves += move_counts[g]
+                w = int(winners[g])
+                if w == -1:
+                    draws += 1
+                else:
+                    wins[rotated_names[w]] = wins.get(rotated_names[w], 0) + 1
+                    seat_wins[w] += 1
+        else:
+            # --- Sequential play for classical-only matchups ---
+            for g in range(n_games):
+                rng_key, game_key = jax.random.split(rng_key)
+                agents = [f() for f in rotated_factories]
+                winner, _scores, moves = play_one_game(agents, rng_key=game_key)
+                total_games += 1
+                total_moves += moves
+                if winner == -1:
+                    draws += 1
+                else:
+                    wins[rotated_names[winner]] = wins.get(rotated_names[winner], 0) + 1
+                    seat_wins[winner] += 1
 
     return {
         "agent_names": agent_names,
@@ -572,12 +682,18 @@ def run_benchmark(checkpoint_path, sims=200, n_games=50,
     net = create_network()
     print(f"  Generation: {gen}")
 
-    # Warm up JIT
-    print("Warming up JIT...")
-    dummy_state = init_state()
-    dummy_rng = jax.random.PRNGKey(999)
-    _ = search(dummy_state, net, variables, dummy_rng, num_simulations=2, temperature=0.01)
-    print("  Done.")
+    # Warm up batched MCTS JIT (compile once, reuse for all matchups)
+    print("Warming up batched MCTS JIT (this takes ~30s on first run)...")
+    t0 = time.time()
+    root_fn, sim_batch_fn, finish_fn, num_batches = _make_move_fns(net, n_games, sims)
+    warmup_states = batched_init_states(n_games)
+    warmup_rngs = jax.random.split(jax.random.PRNGKey(999), n_games)
+    _, trees = root_fn(warmup_states, variables, warmup_rngs)
+    trees = sim_batch_fn(trees, warmup_states, variables)
+    action_rngs = jax.random.split(jax.random.PRNGKey(998), n_games)
+    _ = finish_fn(trees, warmup_states, action_rngs, jnp.float32(0.01))
+    jax.block_until_ready(trees.visit_count)
+    print(f"  JIT warmup done in {time.time() - t0:.1f}s")
 
     # Agent factories
     def make_random(): return RandomAgent()
@@ -585,7 +701,7 @@ def run_benchmark(checkpoint_path, sims=200, n_games=50,
     def make_maxn(): return MaxNAgent(depth=maxn_depth)
     def make_paranoid(): return ParanoidAgent(depth=paranoid_depth)
     def make_shapley(): return ShapleyAgent(depth=shapley_depth)
-    def make_az(): return AlphaZeroAgent(net, variables, sims=sims)
+    def make_az(): return AlphaZeroAgent(sims=sims)
 
     classical_agents = [
         ("Random", make_random),
@@ -606,7 +722,8 @@ def run_benchmark(checkpoint_path, sims=200, n_games=50,
         print(f"\n  {label} ({3 * n_games} games)...", flush=True)
         t0 = time.time()
         rng, sub = jax.random.split(rng)
-        result = run_matchup([make_az, factory, factory], n_games, sub)
+        result = run_matchup([make_az, factory, factory], n_games, sub,
+                             net=net, variables=variables, sims=sims)
         elapsed = time.time() - t0
         az_name = result["agent_names"][0]
         opp_name = result["agent_names"][1]
@@ -650,7 +767,8 @@ def run_benchmark(checkpoint_path, sims=200, n_games=50,
         print(f"\n  {label} ({3 * n_games} games)...", flush=True)
         t0 = time.time()
         rng, sub = jax.random.split(rng)
-        result = run_matchup(factories, n_games, sub)
+        result = run_matchup(factories, n_games, sub,
+                             net=net, variables=variables, sims=sims)
         elapsed = time.time() - t0
         total = result["total_games"]
         wins_str = ", ".join(f"{n}: {w}" for n, w in result["wins"].items())
