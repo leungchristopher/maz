@@ -19,12 +19,13 @@ from maz.train import ReplayBuffer, create_optimizer, train_on_buffer
 # ---------- Config ----------
 PEAK_LR = 1e-3
 WEIGHT_DECAY = 1e-4
-BATCH_SIZE = 2048
-EPOCHS_PER_WINDOW = 6
+BATCH_SIZE = 1024
+EPOCHS_PER_WINDOW = 3
 NUM_GAMES_PER_GEN = 4096
 NUM_SIMULATIONS = 200
 NUM_GENERATIONS = 200
 TEMPERATURE = 1.0
+TEMP_THRESHOLD = 10
 SEED = 42
 CHECKPOINT_DIR = "/content/drive/MyDrive/maz_checkpoints"
 # ----------------------------
@@ -57,7 +58,7 @@ def main(checkpoint_dir=None, use_wandb=False, resume=True):
     optimizer = create_optimizer(PEAK_LR, WEIGHT_DECAY, total_steps)
     opt_state = optimizer.init(variables["params"])
 
-    replay_buffer = ReplayBuffer(initial_capacity=6, max_capacity=30, grow_every=5)
+    replay_buffer = ReplayBuffer(initial_capacity=6, max_capacity=15, grow_every=5)
     start_gen = 0
 
     # Resume from checkpoint
@@ -78,6 +79,7 @@ def main(checkpoint_dir=None, use_wandb=False, resume=True):
         "num_games_per_gen": NUM_GAMES_PER_GEN,
         "num_simulations": NUM_SIMULATIONS,
         "num_generations": NUM_GENERATIONS,
+        "temp_threshold": TEMP_THRESHOLD,
     }
     logger = Logger(use_wandb=use_wandb, config=config)
 
@@ -102,7 +104,8 @@ def main(checkpoint_dir=None, use_wandb=False, resume=True):
         games = run_selfplay(net, variables, sp_rng,
                              num_games=NUM_GAMES_PER_GEN,
                              num_simulations=NUM_SIMULATIONS,
-                             temperature=TEMPERATURE)
+                             temperature=TEMPERATURE,
+                             temp_threshold=TEMP_THRESHOLD)
         sp_elapsed = time.time() - sp_start
 
         lengths = [g.length for g in games]
