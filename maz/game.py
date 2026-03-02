@@ -1,4 +1,4 @@
-"""Connect 3x3: 3-player Connect Four variant on a 6x7 board, connect-3 to win.
+"""Connect 3x3: 3-player Connect Four variant on a 4x5 board, connect-3 to win.
 
 All functions are JIT-compilable — no Python control flow.
 """
@@ -9,8 +9,8 @@ import chex
 import jax
 import jax.numpy as jnp
 
-ROWS = 6
-COLS = 7
+ROWS = 4
+COLS = 5
 NUM_PLAYERS = 3
 CONNECT_K = 3
 

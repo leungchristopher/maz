@@ -63,7 +63,7 @@ class PositionCache:
 
 def play_one_game(net, variables, rng: chex.PRNGKey,
                   num_simulations: int = NUM_SIMULATIONS,
-                  max_moves: int = 42,
+                  max_moves: int = 20,
                   temperature: float = 1.0,
                   temp_threshold: int = 15) -> GameRecord:
     """Play a single self-play game using MCTS.
@@ -250,7 +250,7 @@ def run_selfplay(net, variables, rng: chex.PRNGKey,
                  num_simulations: int = NUM_SIMULATIONS,
                  temperature: float = 1.0,
                  show_progress: bool = True,
-                 max_moves: int = 42,
+                 max_moves: int = 20,
                  temp_threshold: int = 15) -> list[GameRecord]:
     """Run fully vectorized self-play with JIT-fused simulation loop.
 

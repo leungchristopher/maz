@@ -21,8 +21,8 @@ from maz.game import (
 )
 
 MAX_NODES = 2048  # max nodes in the search tree
-C_PUCT = 1.5
-DIRICHLET_ALPHA = 1.4
+C_PUCT = 2.0
+DIRICHLET_ALPHA = 2.0
 DIRICHLET_FRAC = 0.25
 NUM_SIMULATIONS = 50
 VIRTUAL_LOSS = 3.0
