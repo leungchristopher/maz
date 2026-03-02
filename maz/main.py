@@ -25,7 +25,7 @@ NUM_GAMES_PER_GEN = 4096
 NUM_SIMULATIONS = 200
 NUM_GENERATIONS = 200
 TEMPERATURE = 1.0
-TEMP_THRESHOLD = 10
+TEMP_THRESHOLD = 15
 SEED = 42
 CHECKPOINT_DIR = "/content/drive/MyDrive/maz_checkpoints"
 # ----------------------------
