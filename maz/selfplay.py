@@ -134,11 +134,17 @@ def batched_init_states(n: int) -> GameState:
     )
 
 
-def _make_move_fns(net, num_games, num_simulations):
-    """Factory returning JIT-compiled functions for one move.
+_move_fns_cache = {}
 
-    Returns (root_fn, sim_batch_fn, finish_fn):
-      - root_fn: root eval + tree init → (obs, priors, values, trees)
+
+def _make_move_fns(net, num_games, num_simulations):
+    """Factory returning JIT-compiled functions for one move (cached).
+
+    Results are cached by (id(net), num_games, num_simulations) so
+    repeated calls to run_selfplay reuse compiled kernels.
+
+    Returns (root_fn, sim_batch_fn, finish_fn, num_batches):
+      - root_fn: root eval + tree init → (obs, trees)
       - sim_batch_fn: K parallel select + batched NN + expand/backprop
       - finish_fn: policy extraction + action sampling
 
@@ -146,6 +152,10 @@ def _make_move_fns(net, num_games, num_simulations):
     causes multi-minute XLA compilation. The Python sim loop (7 iters)
     adds negligible overhead vs. the old 50-iter loop.
     """
+    cache_key = (id(net), num_games, num_simulations)
+    if cache_key in _move_fns_cache:
+        return _move_fns_cache[cache_key]
+
     N = num_games
     K = SIMS_PER_BATCH
     num_batches = (num_simulations + K - 1) // K  # ceil division
@@ -230,7 +240,9 @@ def _make_move_fns(net, num_games, num_simulations):
         new_states = v_step(states, actions)
         return safe_policies, actions, new_states
 
-    return root_fn, sim_batch_fn, finish_fn, num_batches
+    result = (root_fn, sim_batch_fn, finish_fn, num_batches)
+    _move_fns_cache[cache_key] = result
+    return result
 
 
 def run_selfplay(net, variables, rng: chex.PRNGKey,
@@ -275,16 +287,19 @@ def run_selfplay(net, variables, rng: chex.PRNGKey,
         active_mask = ~states.done
         temp = jnp.float32(temperature if move_num < temp_threshold else 0.01)
 
-        obs, trees = root_fn(states, variables, move_rngs[move_num, :, 0])
+        # Use dynamic JAX index to avoid per-move XLA recompilation
+        move_idx = jnp.int32(move_num)
+
+        obs, trees = root_fn(states, variables, move_rngs[move_idx, :, 0])
         for _ in range(num_batches):
             trees = sim_batch_fn(trees, states, variables)
         policies, actions, new_states = finish_fn(
-            trees, states, move_rngs[move_num, :, 1], temp)
+            trees, states, move_rngs[move_idx, :, 1], temp)
 
-        # Record (cheap array updates)
-        all_obs = all_obs.at[:, move_num].set(
+        # Record (cheap array updates — dynamic index → single cached kernel)
+        all_obs = all_obs.at[:, move_idx].set(
             jnp.where(active_mask[:, None, None, None], obs, 0.0))
-        all_policies = all_policies.at[:, move_num].set(
+        all_policies = all_policies.at[:, move_idx].set(
             jnp.where(active_mask[:, None], policies, 0.0))
         game_lengths = game_lengths + active_mask.astype(jnp.int32)
 
