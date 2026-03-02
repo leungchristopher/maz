@@ -20,7 +20,7 @@ from maz.game import (
     check_win,
 )
 
-MAX_NODES = 512  # max nodes in the search tree
+MAX_NODES = 2048  # max nodes in the search tree
 C_PUCT = 3.0
 DIRICHLET_ALPHA = 1.0
 DIRICHLET_FRAC = 0.25
