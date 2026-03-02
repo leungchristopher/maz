@@ -14,18 +14,43 @@ from maz.selfplay import GameRecord
 
 
 class ReplayBuffer:
-    """Replay buffer with slow window: starts at 4 generations, grows to 20."""
+    """Replay buffer with slow window: starts at 4 generations, grows to 20.
+
+    Stores positions pre-concatenated per generation (3 numpy arrays each)
+    so get_all_positions() only concatenates ~15 arrays, not ~30K.
+    """
 
     def __init__(self, initial_capacity: int = 4, max_capacity: int = 20,
                  grow_every: int = 5):
         self.capacity = initial_capacity
         self.max_capacity = max_capacity
         self.grow_every = grow_every
-        self.generations: deque[list[GameRecord]] = deque()
+        # Each entry: (states_np, policies_np, scores_np) pre-concatenated
+        self.generations: deque = deque()
+        # Keep raw games for checkpoint serialization
+        self._raw_games: deque[list[GameRecord]] = deque()
         self.generation_count = 0
 
     def add_generation(self, games: list[GameRecord]):
-        self.generations.append(games)
+        # Pre-concatenate into numpy arrays (one GPU→CPU transfer per gen)
+        states_list = []
+        policies_list = []
+        scores_list = []
+        for g in games:
+            if g.length > 0:
+                states_list.append(np.asarray(g.states))
+                policies_list.append(np.asarray(g.policies))
+                scores_list.append(np.asarray(g.scores))
+        if states_list:
+            gen_data = (
+                np.concatenate(states_list),
+                np.concatenate(policies_list),
+                np.concatenate(scores_list),
+            )
+        else:
+            gen_data = None
+        self.generations.append(gen_data)
+        self._raw_games.append(games)
         self.generation_count += 1
         # Grow window periodically
         if self.generation_count % self.grow_every == 0:
@@ -33,24 +58,20 @@ class ReplayBuffer:
         # Drop oldest if over capacity
         while len(self.generations) > self.capacity:
             self.generations.popleft()
+            self._raw_games.popleft()
 
     def get_all_positions(self):
-        """Flatten all games into (states, policies, scores) arrays."""
-        all_states = []
-        all_policies = []
-        all_scores = []
-        for gen in self.generations:
-            for game in gen:
-                if game.length > 0:
-                    all_states.append(game.states)
-                    all_policies.append(game.policies)
-                    all_scores.append(game.scores)
-        if not all_states:
+        """Flatten all generations into (states, policies, scores) arrays.
+
+        Only concatenates ~15 pre-built numpy arrays instead of ~30K game arrays.
+        """
+        gen_arrays = [g for g in self.generations if g is not None]
+        if not gen_arrays:
             return None, None, None
         return (
-            jnp.concatenate(all_states),
-            jnp.concatenate(all_policies),
-            jnp.concatenate(all_scores),
+            jnp.asarray(np.concatenate([g[0] for g in gen_arrays])),
+            jnp.asarray(np.concatenate([g[1] for g in gen_arrays])),
+            jnp.asarray(np.concatenate([g[2] for g in gen_arrays])),
         )
 
 
@@ -180,16 +201,22 @@ def train_on_buffer(net, variables, optimizer, opt_state,
     except ImportError:
         tqdm = None
 
+    import time as _time
+
+    t0 = _time.time()
     states, policies, scores = replay_buffer.get_all_positions()
     if states is None:
         return variables, opt_state, {}
+    print(f"  get_all_positions: {len(states)} positions [{_time.time()-t0:.1f}s]")
 
     # Position averaging
     if do_averaging and len(states) > 0:
+        t0 = _time.time()
         states, policies, scores = average_positions(states, policies, scores)
+        print(f"  average_positions: {len(states)} unique [{_time.time()-t0:.1f}s]")
 
     num_positions = len(states)
-    print(f"  Training on {num_positions} unique positions")
+    print(f"  Training on {num_positions} positions")
 
     params = variables["params"]
     batch_stats = variables.get("batch_stats", {})

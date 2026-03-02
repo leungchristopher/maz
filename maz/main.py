@@ -122,12 +122,14 @@ def main(checkpoint_dir=None, use_wandb=False, resume=True):
         history["sp_time"].append(sp_elapsed)
 
         # 2. Add to replay buffer
+        buf_t0 = time.time()
         replay_buffer.add_generation(games)
         buf_positions = sum(
-            g.length for gen_games in replay_buffer.generations for g in gen_games
+            len(g[0]) for g in replay_buffer.generations if g is not None
         )
+        buf_elapsed = time.time() - buf_t0
         print(f"  Buffer: {len(replay_buffer.generations)}/{replay_buffer.capacity} "
-              f"generations, ~{buf_positions} positions")
+              f"generations, ~{buf_positions} positions [{buf_elapsed:.1f}s]")
 
         # 3. Train
         train_t0 = time.time()
@@ -162,12 +164,16 @@ def main(checkpoint_dir=None, use_wandb=False, resume=True):
                   f"{metrics['num_steps']} steps [{train_elapsed:.1f}s]")
             logger.log_training(gen, metrics)
 
-        # 4. Checkpoint
-        try:
-            save_checkpoint(checkpoint_dir, variables, opt_state,
-                            replay_buffer, gen, rng)
-        except Exception as e:
-            print(f"  Warning: checkpoint save failed: {e}")
+        # 4. Checkpoint (every 5 gens to avoid slow Drive I/O)
+        if gen % 5 == 0 or gen == NUM_GENERATIONS - 1:
+            ckpt_t0 = time.time()
+            try:
+                save_checkpoint(checkpoint_dir, variables, opt_state,
+                                replay_buffer, gen, rng)
+                ckpt_elapsed = time.time() - ckpt_t0
+                print(f"  Checkpoint saved [{ckpt_elapsed:.1f}s]")
+            except Exception as e:
+                print(f"  Warning: checkpoint save failed: {e}")
 
         gen_elapsed = time.time() - gen_start
         wall_elapsed = time.time() - train_start

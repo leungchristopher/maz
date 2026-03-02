@@ -8,6 +8,7 @@ import pickle
 import shutil
 from collections import deque
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 
@@ -52,12 +53,17 @@ def save_checkpoint(ckpt_dir, variables, opt_state, replay_buffer,
         "generation": generation,
         "buffer": {
             "generations": [
+                (np.asarray(g[0]), np.asarray(g[1]), np.asarray(g[2]))
+                if g is not None else None
+                for g in replay_buffer.generations
+            ],
+            "raw_games": [
                 [g._replace(
                     states=g.states.__array__() if isinstance(g.states, jnp.ndarray) else g.states,
                     policies=g.policies.__array__() if isinstance(g.policies, jnp.ndarray) else g.policies,
                     scores=g.scores.__array__() if isinstance(g.scores, jnp.ndarray) else g.scores,
                 ) for g in gen_games]
-                for gen_games in replay_buffer.generations
+                for gen_games in replay_buffer._raw_games
             ],
             "capacity": replay_buffer.capacity,
             "generation_count": replay_buffer.generation_count,
@@ -131,14 +137,17 @@ def load_checkpoint(ckpt_dir, variables_template, opt_state_template,
     )
     replay_buffer.capacity = buf["capacity"]
     replay_buffer.generation_count = buf["generation_count"]
-    replay_buffer.generations = deque(
+    # Restore pre-concatenated generation arrays
+    replay_buffer.generations = deque(buf["generations"])
+    # Restore raw games for checkpoint re-serialization
+    replay_buffer._raw_games = deque(
         [[GameRecord(
             states=jnp.asarray(g.states),
             policies=jnp.asarray(g.policies),
             scores=jnp.asarray(g.scores),
             length=g.length,
         ) for g in gen_games]
-         for gen_games in buf["generations"]]
+         for gen_games in buf.get("raw_games", buf["generations"])]
     )
 
     return variables, opt_state, replay_buffer, generation, rng
