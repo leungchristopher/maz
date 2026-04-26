@@ -1,11 +1,3 @@
-"""Play against a trained MAZ agent from a .pkl checkpoint.
-
-Usage:
-    python -m maz.play checkpoint.pkl          # play as Player 1 (index 0)
-    python -m maz.play checkpoint.pkl --player 2  # play as Player 2
-    python -m maz.play checkpoint.pkl --sims 400  # stronger AI (more search)
-"""
-
 import sys
 import pickle
 import argparse
@@ -26,7 +18,6 @@ PLAYER_NAMES = ["Player 1 (X)", "Player 2 (O)", "Player 3 (#)"]
 
 
 def load_from_pkl(path):
-    """Load network variables from a pickle checkpoint."""
     with open(path, "rb") as f:
         state = pickle.load(f)
     variables = jax.tree.map(jnp.asarray, state["variables"])
@@ -35,7 +26,6 @@ def load_from_pkl(path):
 
 
 def print_board(state):
-    """Print the board with column numbers."""
     board = state.board
     print()
     print("  " + " ".join(str(i) for i in range(COLS)))
@@ -48,7 +38,6 @@ def print_board(state):
 
 
 def get_human_action(state):
-    """Prompt the human for a valid column."""
     valid = get_valid_actions(state)
     valid_cols = [c for c in range(COLS) if valid[c]]
     while True:
@@ -62,7 +51,6 @@ def get_human_action(state):
 
 
 def ai_move(state, net, variables, rng, num_sims, temperature=0.01):
-    """Run MCTS and pick the best move."""
     rng, search_rng = jax.random.split(rng)
     policy = search(state, net, variables, search_rng,
                     num_simulations=num_sims, temperature=temperature)
@@ -71,7 +59,6 @@ def ai_move(state, net, variables, rng, num_sims, temperature=0.01):
 
 
 def play_game(variables, human_player=0, num_sims=NUM_SIMULATIONS):
-    """Play one game: human vs AI agents."""
     net = create_network()
     rng = jax.random.PRNGKey(42)
     state = init_state()
@@ -99,7 +86,6 @@ def play_game(variables, human_player=0, num_sims=NUM_SIMULATIONS):
         print_board(state)
         move_num += 1
 
-    # Game over
     winner = int(state.winner)
     if winner == -1:
         print("=== DRAW ===")
@@ -127,7 +113,7 @@ def main():
     variables, gen = load_from_pkl(args.checkpoint)
     print(f"  Generation: {gen}")
 
-    human_player = args.player - 1  # convert to 0-indexed
+    human_player = args.player - 1
 
     while True:
         play_game(variables, human_player=human_player, num_sims=args.sims)

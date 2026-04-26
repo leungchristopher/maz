@@ -1,8 +1,3 @@
-"""Checkpoint save/load for resumable training across Colab/Kaggle sessions.
-
-Uses JAX's built-in serialization + pickle. No orbax dependency.
-"""
-
 import os
 import pickle
 import shutil
@@ -14,7 +9,6 @@ import jax.numpy as jnp
 
 
 def _pytree_to_numpy(pytree):
-    """Convert JAX arrays to numpy for pickling."""
     return jax.tree.map(
         lambda x: x.__array__() if isinstance(x, jnp.ndarray) else x,
         pytree,
@@ -22,7 +16,6 @@ def _pytree_to_numpy(pytree):
 
 
 def _numpy_to_jax(pytree):
-    """Convert numpy arrays back to JAX arrays."""
     return jax.tree.map(
         lambda x: jnp.asarray(x) if hasattr(x, '__array__') else x,
         pytree,
@@ -31,21 +24,9 @@ def _numpy_to_jax(pytree):
 
 def save_checkpoint(ckpt_dir, variables, opt_state, replay_buffer,
                     generation, rng, keep=2):
-    """Save training state to disk.
-
-    Args:
-        ckpt_dir: root checkpoint directory
-        variables: network variables dict (params + batch_stats)
-        opt_state: optimizer state
-        replay_buffer: ReplayBuffer instance
-        generation: current generation number (0-indexed)
-        rng: JAX PRNGKey
-        keep: number of recent checkpoints to keep
-    """
     os.makedirs(ckpt_dir, exist_ok=True)
     tag = f"gen_{generation:05d}"
 
-    # Save everything in a single pickle file
     state = {
         "variables": _pytree_to_numpy(variables),
         "opt_state": _pytree_to_numpy(opt_state),
@@ -76,18 +57,15 @@ def save_checkpoint(ckpt_dir, variables, opt_state, replay_buffer,
     tmp_path = ckpt_path + ".tmp"
     with open(tmp_path, "wb") as f:
         pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(tmp_path, ckpt_path)  # atomic rename
+    os.replace(tmp_path, ckpt_path)
 
-    # Update latest.txt
     with open(os.path.join(ckpt_dir, "latest.txt"), "w") as f:
         f.write(str(generation))
 
-    # Cleanup old checkpoints
     _cleanup_old(ckpt_dir, generation, keep)
 
 
 def _cleanup_old(ckpt_dir, current_gen, keep):
-    """Remove checkpoints older than the most recent `keep`."""
     keep_gens = set(range(max(0, current_gen - keep + 1), current_gen + 1))
     for entry in os.listdir(ckpt_dir):
         if not entry.startswith("gen_"):
@@ -107,11 +85,6 @@ def _cleanup_old(ckpt_dir, current_gen, keep):
 
 def load_checkpoint(ckpt_dir, variables_template, opt_state_template,
                     rng_template):
-    """Load training state from the latest checkpoint.
-
-    Returns:
-        (variables, opt_state, replay_buffer, generation, rng)
-    """
     from maz.train import ReplayBuffer
     from maz.selfplay import GameRecord
 
@@ -137,9 +110,7 @@ def load_checkpoint(ckpt_dir, variables_template, opt_state_template,
     )
     replay_buffer.capacity = buf["capacity"]
     replay_buffer.generation_count = buf["generation_count"]
-    # Restore pre-concatenated generation arrays
     replay_buffer.generations = deque(buf["generations"])
-    # Restore raw games for checkpoint re-serialization
     replay_buffer._raw_games = deque(
         [[GameRecord(
             states=jnp.asarray(g.states),
@@ -154,5 +125,4 @@ def load_checkpoint(ckpt_dir, variables_template, opt_state_template,
 
 
 def checkpoint_exists(ckpt_dir):
-    """Check if a checkpoint exists in the given directory."""
     return os.path.isfile(os.path.join(ckpt_dir, "latest.txt"))

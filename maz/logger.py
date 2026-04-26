@@ -1,9 +1,4 @@
-"""Thin W&B logging wrapper. No-ops gracefully when wandb is absent."""
-
-
 class Logger:
-    """Logs training metrics to W&B if available, otherwise no-ops."""
-
     def __init__(self, use_wandb=False, project="maz", config=None):
         self.use_wandb = use_wandb
         self._wandb = None
@@ -20,7 +15,6 @@ class Logger:
                 self.use_wandb = False
 
     def log_selfplay(self, gen, games):
-        """Log self-play statistics."""
         if not self.use_wandb:
             return
         lengths = [g.length for g in games]
@@ -32,7 +26,6 @@ class Logger:
         }, step=gen)
 
     def log_training(self, gen, metrics):
-        """Log training metrics."""
         if not self.use_wandb or not metrics:
             return
         self._wandb.log({
@@ -43,6 +36,5 @@ class Logger:
         }, step=gen)
 
     def finish(self):
-        """Finalize the W&B run."""
         if self.use_wandb and self._wandb:
             self._wandb.finish()

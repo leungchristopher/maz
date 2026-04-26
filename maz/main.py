@@ -1,12 +1,9 @@
-"""Orchestration: self-play → train → repeat."""
-
 import os
 import time
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-# Persistent compilation cache — avoids re-compiling JIT kernels across runs
 _default_cache = os.path.join(os.path.dirname(__file__), "..", ".jax_cache")
 jax.config.update("jax_compilation_cache_dir",
                   os.environ.get("JAX_CACHE_DIR", os.path.abspath(_default_cache)))
@@ -16,7 +13,6 @@ from maz.selfplay import run_selfplay
 from maz.train import ReplayBuffer, create_optimizer, train_on_buffer
 
 
-# ---------- Config ----------
 PEAK_LR = 1e-3
 WEIGHT_DECAY = 1e-4
 BATCH_SIZE = 1024
@@ -28,7 +24,6 @@ TEMPERATURE = 1.0
 TEMP_THRESHOLD = 15
 SEED = 42
 CHECKPOINT_DIR = "/content/drive/MyDrive/maz_checkpoints"
-# ----------------------------
 
 
 def main(checkpoint_dir=None, use_wandb=False, resume=True):
@@ -46,13 +41,11 @@ def main(checkpoint_dir=None, use_wandb=False, resume=True):
 
     rng = jax.random.PRNGKey(SEED)
 
-    # Initialize network
     net = create_network()
     rng, init_rng = jax.random.split(rng)
     variables = init_params(init_rng)
 
-    # Estimate total training steps for LR schedule
-    est_positions_per_gen = NUM_GAMES_PER_GEN * 20  # rough average game length
+    est_positions_per_gen = NUM_GAMES_PER_GEN * 20
     est_steps_per_gen = max(1, (est_positions_per_gen // BATCH_SIZE) * EPOCHS_PER_WINDOW)
     total_steps = est_steps_per_gen * NUM_GENERATIONS
     optimizer = create_optimizer(PEAK_LR, WEIGHT_DECAY, total_steps)
@@ -61,7 +54,6 @@ def main(checkpoint_dir=None, use_wandb=False, resume=True):
     replay_buffer = ReplayBuffer(initial_capacity=6, max_capacity=15, grow_every=5)
     start_gen = 0
 
-    # Resume from checkpoint
     if resume and checkpoint_exists(checkpoint_dir):
         print(f"Resuming from checkpoint in {checkpoint_dir}")
         variables, opt_state, replay_buffer, last_gen, rng = load_checkpoint(
@@ -70,7 +62,6 @@ def main(checkpoint_dir=None, use_wandb=False, resume=True):
         start_gen = last_gen + 1
         print(f"Resumed at generation {start_gen}")
 
-    # Logger
     config = {
         "peak_lr": PEAK_LR,
         "weight_decay": WEIGHT_DECAY,
@@ -89,7 +80,6 @@ def main(checkpoint_dir=None, use_wandb=False, resume=True):
     print(f"Estimated {total_steps} total training steps")
     print()
 
-    # Metric history for trend tracking
     history = {"value_loss": [], "policy_loss": [], "total_loss": [],
                "mean_length": [], "positions": [], "sp_time": [], "train_time": []}
     train_start = time.time()
@@ -98,7 +88,6 @@ def main(checkpoint_dir=None, use_wandb=False, resume=True):
         gen_start = time.time()
         print(f"=== Generation {gen + 1}/{NUM_GENERATIONS} ===")
 
-        # 1. Self-play
         sp_start = time.time()
         rng, sp_rng = jax.random.split(rng)
         games = run_selfplay(net, variables, sp_rng,
@@ -121,7 +110,6 @@ def main(checkpoint_dir=None, use_wandb=False, resume=True):
         history["mean_length"].append(mean_len)
         history["sp_time"].append(sp_elapsed)
 
-        # 2. Add to replay buffer
         buf_t0 = time.time()
         replay_buffer.add_generation(games)
         buf_positions = sum(
@@ -131,7 +119,6 @@ def main(checkpoint_dir=None, use_wandb=False, resume=True):
         print(f"  Buffer: {len(replay_buffer.generations)}/{replay_buffer.capacity} "
               f"generations, ~{buf_positions} positions [{buf_elapsed:.1f}s]")
 
-        # 3. Train
         train_t0 = time.time()
         variables, opt_state, metrics = train_on_buffer(
             net, variables, optimizer, opt_state,
@@ -151,7 +138,6 @@ def main(checkpoint_dir=None, use_wandb=False, resume=True):
             history["positions"].append(metrics["num_positions"])
             history["train_time"].append(train_elapsed)
 
-            # Show current + trend (last 5 gens)
             trend = ""
             if len(history["total_loss"]) >= 2:
                 prev = np.mean(history["total_loss"][-6:-1])
@@ -164,7 +150,6 @@ def main(checkpoint_dir=None, use_wandb=False, resume=True):
                   f"{metrics['num_steps']} steps [{train_elapsed:.1f}s]")
             logger.log_training(gen, metrics)
 
-        # 4. Checkpoint (every 5 gens to avoid slow Drive I/O)
         if gen % 5 == 0 or gen == NUM_GENERATIONS - 1:
             ckpt_t0 = time.time()
             try:
@@ -184,7 +169,6 @@ def main(checkpoint_dir=None, use_wandb=False, resume=True):
               f"Elapsed: {wall_elapsed/60:.1f}m | ETA: {eta/60:.1f}m")
         print()
 
-    # Final summary
     logger.finish()
     total_elapsed = time.time() - train_start
     print(f"Training complete! {NUM_GENERATIONS - start_gen} generations "

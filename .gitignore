@@ -4,7 +4,10 @@ maz_checkpoints/
 __pycache__/
 *.py[codz]
 *$py.class
-
+MAZ training/
+report/
+writeup
+.jax_cache/
 # C extensions
 *.so
 

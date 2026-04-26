@@ -1,11 +1,3 @@
-"""Fully vectorized self-play: vmap over games, JIT-fused sim loop on GPU.
-
-All tree operations are vmapped over N games. The simulation loop uses
-jax.lax.fori_loop + scan so an entire move compiles to a single XLA kernel.
-K=8 leaves are selected per iteration (virtual-loss steered) for larger NN
-batch sizes and fewer sequential steps.
-"""
-
 from typing import NamedTuple
 
 import jax
@@ -22,20 +14,17 @@ from maz.mcts import (
     batched_new_tree, expand_or_noop,
 )
 
-SIMS_PER_BATCH = 8  # K parallel sims per fori_loop iteration
+SIMS_PER_BATCH = 8
 
 
 class GameRecord(NamedTuple):
-    """A single completed game's data."""
-    states: chex.Array     # (T, 6, 7, 6) encoded states
-    policies: chex.Array   # (T, 7) MCTS policies
-    scores: chex.Array     # (T, 3) outcome scores (same for all timesteps)
-    length: int            # actual game length
+    states: chex.Array
+    policies: chex.Array
+    scores: chex.Array
+    length: int
 
 
 class PositionCache:
-    """LRU cache for NN evaluations keyed on board bytes."""
-
     def __init__(self, max_size: int = 10000):
         self.max_size = max_size
         self.cache: dict[bytes, tuple] = {}
@@ -66,17 +55,6 @@ def play_one_game(net, variables, rng: chex.PRNGKey,
                   max_moves: int = 20,
                   temperature: float = 1.0,
                   temp_threshold: int = 15) -> GameRecord:
-    """Play a single self-play game using MCTS.
-
-    Args:
-        net: AlphaZero network
-        variables: network parameters
-        rng: random key
-        num_simulations: MCTS simulations per move
-        max_moves: maximum game length
-        temperature: exploration temperature
-        temp_threshold: after this many moves, use temperature=0
-    """
     state = init_state()
     states_list = []
     policies_list = []
@@ -94,16 +72,13 @@ def play_one_game(net, variables, rng: chex.PRNGKey,
         states_list.append(obs)
         policies_list.append(policy)
 
-        # Sample action from policy
         action = jax.random.choice(action_rng, NUM_ACTIONS, p=policy)
         state = step(state, action)
 
-    # Get final scores
     scores = get_scores(state)
     game_len = len(states_list)
 
     if game_len == 0:
-        # Edge case: game was already done
         return GameRecord(
             states=jnp.zeros((1, ROWS, COLS, 6)),
             policies=jnp.ones((1, NUM_ACTIONS)) / NUM_ACTIONS,
@@ -113,7 +88,6 @@ def play_one_game(net, variables, rng: chex.PRNGKey,
 
     states_arr = jnp.stack(states_list)
     policies_arr = jnp.stack(policies_list)
-    # Broadcast scores to all timesteps
     scores_arr = jnp.broadcast_to(scores, (game_len, NUM_PLAYERS))
 
     return GameRecord(
@@ -125,7 +99,6 @@ def play_one_game(net, variables, rng: chex.PRNGKey,
 
 
 def batched_init_states(n: int) -> GameState:
-    """Create N initial game states with leading batch dimension."""
     return GameState(
         board=jnp.zeros((n, ROWS, COLS), dtype=jnp.int8),
         current_player=jnp.zeros(n, dtype=jnp.int32),
@@ -138,29 +111,14 @@ _move_fns_cache = {}
 
 
 def _make_move_fns(net, num_games, num_simulations):
-    """Factory returning JIT-compiled functions for one move (cached).
-
-    Results are cached by (id(net), num_games, num_simulations) so
-    repeated calls to run_selfplay reuse compiled kernels.
-
-    Returns (root_fn, sim_batch_fn, finish_fn, num_batches):
-      - root_fn: root eval + tree init → (obs, trees)
-      - sim_batch_fn: K parallel select + batched NN + expand/backprop
-      - finish_fn: policy extraction + action sampling
-
-    Splitting avoids nesting fori_loop/scan inside a single JIT, which
-    causes multi-minute XLA compilation. The Python sim loop (7 iters)
-    adds negligible overhead vs. the old 50-iter loop.
-    """
     cache_key = (id(net), num_games, num_simulations)
     if cache_key in _move_fns_cache:
         return _move_fns_cache[cache_key]
 
     N = num_games
     K = SIMS_PER_BATCH
-    num_batches = (num_simulations + K - 1) // K  # ceil division
+    num_batches = (num_simulations + K - 1) // K
 
-    # Vmapped ops (closure-captured, static for JIT)
     v_encode = jax.vmap(encode_state)
     v_init_root = jax.vmap(init_root)
     v_select = jax.vmap(select_leaf)
@@ -171,7 +129,6 @@ def _make_move_fns(net, num_games, num_simulations):
     v_get_scores = jax.vmap(get_scores)
     v_expand = jax.vmap(expand_node)
 
-    # Shared constants
     root_paths = jnp.broadcast_to(
         jnp.array([0] + [-1] * 19, jnp.int32), (N, 20))
     node_zeros = jnp.zeros(N, dtype=jnp.int32)
@@ -179,7 +136,6 @@ def _make_move_fns(net, num_games, num_simulations):
 
     @jax.jit
     def root_fn(states, variables, noise_rngs):
-        """Root eval + tree init."""
         obs = v_encode(states)
         logits, values = net.apply(variables, obs, train=False)
         priors = jax.nn.softmax(logits)
@@ -191,15 +147,12 @@ def _make_move_fns(net, num_games, num_simulations):
 
     @jax.jit
     def sim_batch_fn(trees, states, variables):
-        """One batch of K parallel sims: select K leaves, batch NN, expand+backprop."""
-        # 1) Select K leaves sequentially (virtual loss steers diversity)
         def select_one(trees, _):
             trees, idxs, lstates, paths, plens = v_select(trees, states)
             return trees, (idxs, lstates, paths, plens)
         trees_vl, (all_idxs, all_lstates, all_paths, all_plens) = \
             jax.lax.scan(select_one, trees, None, length=K)
 
-        # 2) Batch NN eval: (K,N,...) → (K*N,...) → NN → reshape
         flat_lstates = jax.tree.map(
             lambda x: x.reshape(K * N, *x.shape[2:]), all_lstates)
         flat_obs = v_encode(flat_lstates)
@@ -210,10 +163,9 @@ def _make_move_fns(net, num_games, num_simulations):
         all_priors = jax.nn.softmax(flat_logits).reshape(K, N, NUM_ACTIONS)
         all_vals = flat_vals.reshape(K, N, NUM_PLAYERS)
         all_scores = flat_scores.reshape(K, N, NUM_PLAYERS)
-        all_done = all_lstates.done  # (K, N)
+        all_done = all_lstates.done
         all_vals = jnp.where(all_done[:, :, None], all_scores, all_vals)
 
-        # 3) Expand + backprop K leaves sequentially
         def expand_backprop_one(trees, k_data):
             idxs, lstates_k, priors_k, vals_k, done_k, paths_k, plens_k = k_data
             trees = v_expand_or_noop(
@@ -229,7 +181,6 @@ def _make_move_fns(net, num_games, num_simulations):
 
     @jax.jit
     def finish_fn(trees, states, action_rngs, temp):
-        """Policy extraction + action sampling."""
         policies = v_get_policy(trees, temp)
         safe_policies = jnp.where(
             states.done[:, None],
@@ -252,11 +203,6 @@ def run_selfplay(net, variables, rng: chex.PRNGKey,
                  show_progress: bool = True,
                  max_moves: int = 20,
                  temp_threshold: int = 15) -> list[GameRecord]:
-    """Run fully vectorized self-play with JIT-fused simulation loop.
-
-    Each move compiles to a single XLA kernel via jax.lax.fori_loop.
-    K=8 leaves are selected per iteration for larger NN batch sizes.
-    """
     try:
         from tqdm.auto import tqdm
     except ImportError:
@@ -267,12 +213,10 @@ def run_selfplay(net, variables, rng: chex.PRNGKey,
         net, N, num_simulations)
     states = batched_init_states(N)
 
-    # Pre-allocate recording arrays: (N, max_moves, ...)
     all_obs = jnp.zeros((N, max_moves, ROWS, COLS, 6))
     all_policies = jnp.zeros((N, max_moves, NUM_ACTIONS))
     game_lengths = jnp.zeros(N, dtype=jnp.int32)
 
-    # Pre-split all RNG keys: (max_moves, N, 2, 2) — 2 keys per game per move
     move_rngs = jax.random.split(rng, max_moves * N * 2).reshape(
         max_moves, N, 2, 2
     )
@@ -287,7 +231,6 @@ def run_selfplay(net, variables, rng: chex.PRNGKey,
         active_mask = ~states.done
         temp = jnp.float32(temperature if move_num < temp_threshold else 0.01)
 
-        # Use dynamic JAX index to avoid per-move XLA recompilation
         move_idx = jnp.int32(move_num)
 
         obs, trees = root_fn(states, variables, move_rngs[move_idx, :, 0])
@@ -296,14 +239,12 @@ def run_selfplay(net, variables, rng: chex.PRNGKey,
         policies, actions, new_states = finish_fn(
             trees, states, move_rngs[move_idx, :, 1], temp)
 
-        # Record (cheap array updates — dynamic index → single cached kernel)
         all_obs = all_obs.at[:, move_idx].set(
             jnp.where(active_mask[:, None, None, None], obs, 0.0))
         all_policies = all_policies.at[:, move_idx].set(
             jnp.where(active_mask[:, None], policies, 0.0))
         game_lengths = game_lengths + active_mask.astype(jnp.int32)
 
-        # Mask done games: keep old state for finished games
         states = jax.tree.map(
             lambda new, old: jnp.where(
                 active_mask.reshape(-1, *([1] * (new.ndim - 1))), new, old),
@@ -313,7 +254,6 @@ def run_selfplay(net, variables, rng: chex.PRNGKey,
             n_active = int(active_mask.sum())
             move_iter.set_postfix(active=n_active)
 
-    # Build GameRecord list (CPU, once)
     final_scores = jax.vmap(get_scores)(states)
     games = []
     for i, L in enumerate(int(x) for x in game_lengths):

@@ -1,5 +1,3 @@
-"""Training loop with AdamW, 1-cycle LR, replay buffer, and position averaging."""
-
 import functools
 from collections import deque
 
@@ -14,25 +12,16 @@ from maz.selfplay import GameRecord
 
 
 class ReplayBuffer:
-    """Replay buffer with slow window: starts at 4 generations, grows to 20.
-
-    Stores positions pre-concatenated per generation (3 numpy arrays each)
-    so get_all_positions() only concatenates ~15 arrays, not ~30K.
-    """
-
     def __init__(self, initial_capacity: int = 4, max_capacity: int = 20,
                  grow_every: int = 5):
         self.capacity = initial_capacity
         self.max_capacity = max_capacity
         self.grow_every = grow_every
-        # Each entry: (states_np, policies_np, scores_np) pre-concatenated
         self.generations: deque = deque()
-        # Keep raw games for checkpoint serialization
         self._raw_games: deque[list[GameRecord]] = deque()
         self.generation_count = 0
 
     def add_generation(self, games: list[GameRecord]):
-        # Pre-concatenate into numpy arrays (one GPU→CPU transfer per gen)
         states_list = []
         policies_list = []
         scores_list = []
@@ -52,19 +41,13 @@ class ReplayBuffer:
         self.generations.append(gen_data)
         self._raw_games.append(games)
         self.generation_count += 1
-        # Grow window periodically
         if self.generation_count % self.grow_every == 0:
             self.capacity = min(self.capacity + 1, self.max_capacity)
-        # Drop oldest if over capacity
         while len(self.generations) > self.capacity:
             self.generations.popleft()
             self._raw_games.popleft()
 
     def get_all_positions(self):
-        """Flatten all generations into (states, policies, scores) arrays.
-
-        Only concatenates ~15 pre-built numpy arrays instead of ~30K game arrays.
-        """
         gen_arrays = [g for g in self.generations if g is not None]
         if not gen_arrays:
             return None, None, None
@@ -77,17 +60,10 @@ class ReplayBuffer:
 
 def average_positions(states: jnp.ndarray, policies: jnp.ndarray,
                       scores: jnp.ndarray):
-    """Deduplicate positions by board hash, averaging π and z.
-
-    Uses numpy vectorized hashing + pandas-free groupby via np.unique.
-    """
-    # Move to numpy for fast hashing
     s_np = np.asarray(states).reshape(len(states), -1)
     p_np = np.asarray(policies)
     z_np = np.asarray(scores)
 
-    # Hash each row to a single int64 for fast grouping
-    # Use a view-based approach: treat each flattened state as bytes
     s_bytes = np.ascontiguousarray(s_np).view(
         np.dtype((np.void, s_np.dtype.itemsize * s_np.shape[1])))
     _, unique_idx, inverse = np.unique(
@@ -96,7 +72,6 @@ def average_positions(states: jnp.ndarray, policies: jnp.ndarray,
 
     n_unique = len(unique_idx)
 
-    # Scatter-add policies and scores, then divide by counts
     counts = np.bincount(inverse, minlength=n_unique).astype(np.float32)
     avg_policies = np.zeros((n_unique, p_np.shape[1]), dtype=np.float32)
     avg_scores = np.zeros((n_unique, z_np.shape[1]), dtype=np.float32)
@@ -113,7 +88,6 @@ def average_positions(states: jnp.ndarray, policies: jnp.ndarray,
 
 
 def make_1cycle_schedule(peak_lr: float, total_steps: int):
-    """1-cycle LR: warm up first 30%, cosine decay remaining 70%."""
     warmup_steps = int(total_steps * 0.3)
     decay_steps = total_steps - warmup_steps
     min_lr = peak_lr / 25.0
@@ -126,33 +100,23 @@ def make_1cycle_schedule(peak_lr: float, total_steps: int):
 
 def create_optimizer(peak_lr: float = 1e-3, weight_decay: float = 1e-4,
                      total_steps: int = 1000):
-    """Create AdamW optimizer with 1-cycle schedule."""
     schedule = make_1cycle_schedule(peak_lr, total_steps)
     return optax.adamw(schedule, weight_decay=weight_decay)
 
 
 def compute_loss(params, batch_state, net, states, policies, scores):
-    """Compute combined MSE + CE loss.
-
-    L = MSE(z, v) + CE(π, p)
-    MSE = mean((z - v)^2) over 3-player vector
-    CE = -sum(π * log(p))
-    """
     policy_logits, values = net.apply(
         {"params": params, "batch_stats": batch_state},
         states, train=True,
         mutable=["batch_stats"],
     )
-    # Unpack mutable returns
     if isinstance(policy_logits, tuple) and len(policy_logits) == 2:
         (policy_logits, values), new_batch_state = policy_logits, values
     else:
         new_batch_state = {"batch_stats": batch_state}
 
-    # Value loss: MSE over 3-player vector
     value_loss = jnp.mean((scores - values) ** 2)
 
-    # Policy loss: cross-entropy
     log_probs = jax.nn.log_softmax(policy_logits)
     policy_loss = -jnp.mean(jnp.sum(policies * log_probs, axis=-1))
 
@@ -161,8 +125,6 @@ def compute_loss(params, batch_state, net, states, policies, scores):
 
 
 def make_train_step(net, optimizer):
-    """Create a JIT-compiled training step."""
-
     @jax.jit
     def train_step(params, batch_stats, opt_state, states, policies, scores):
         def loss_fn(params):
@@ -192,10 +154,6 @@ def train_on_buffer(net, variables, optimizer, opt_state,
                     epochs: int = 2,
                     do_averaging: bool = True,
                     show_progress: bool = True):
-    """Train on all positions in the replay buffer.
-
-    Returns updated (variables, opt_state, metrics).
-    """
     try:
         from tqdm.auto import tqdm
     except ImportError:
@@ -209,7 +167,6 @@ def train_on_buffer(net, variables, optimizer, opt_state,
         return variables, opt_state, {}
     print(f"  get_all_positions: {len(states)} positions [{_time.time()-t0:.1f}s]")
 
-    # Position averaging
     if do_averaging and len(states) > 0:
         t0 = _time.time()
         states, policies, scores = average_positions(states, policies, scores)
@@ -233,7 +190,6 @@ def train_on_buffer(net, variables, optimizer, opt_state,
         pbar = tqdm(total=num_batches, desc="Training", unit="batch")
 
     for epoch in range(epochs):
-        # Shuffle
         rng = jax.random.PRNGKey(epoch)
         perm = jax.random.permutation(rng, num_positions)
         states_shuf = states[perm]
